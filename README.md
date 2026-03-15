@@ -5,3 +5,5 @@
 是communication
 含金量有多高呢？
 相当于你随手打的comment
+dictionary means old files that unused for apply
+nevermind，a stupid student with his first rubbish
