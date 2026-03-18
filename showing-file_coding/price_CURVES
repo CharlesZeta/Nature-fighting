@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+Option Price vs Strike: DST (Rough Heston + Dual Hawkes), Merton, BSM
+  - European & American Put/Call
+  - Multiple alpha (gamma) values for DST
+  - Control variate diagnostics per alpha
+"""
+
+import math
+import numpy as np
+from scipy.stats import norm
+from scipy.optimize import brentq
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+matplotlib.rcParams['mathtext.fontset'] = 'dejavusans'
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(2024)
+
+# ============================================================
+# 1. BSM
+# ============================================================
+def bsm_price(S, K, T, r, sigma, opt='put'):
+    d1 = (np.log(S/K) + (r + .5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    if opt == 'call':
+        return S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+    return K*np.exp(-r*T)*norm.cdf(-d2) - S*norm.cdf(-d1)
+
+# ============================================================
+# 2. Merton European (series)
+# ============================================================
+def merton_euro(S, K, T, r, sig, lam, mJ, sJ, opt='put', Nt=30):
+    ms = np.exp(mJ + .5*sJ**2) - 1
+    p = 0.0
+    for n in range(Nt):
+        sn = np.sqrt(sig**2 + n*sJ**2/T)
+        rn = r - lam*ms + n*np.log(1+ms)/T
+        lp = lam*(1+ms)
+        w = np.exp(-lp*T) * (lp*T)**n / math.factorial(n)
+        p += w * bsm_price(S, K, T, rn, sn, opt)
+    return p
+
+# ============================================================
+# 3. Merton MC paths
+# ============================================================
+def merton_paths(S0, r, sig, lam, mJ, sJ, T, Ns, Np):
+    dt = T/Ns
+    ms = np.exp(mJ + .5*sJ**2) - 1
+    S = np.zeros((Np, Ns+1)); S[:,0] = S0
+    for i in range(Ns):
+        Z = np.random.randn(Np)
+        Nj = np.random.poisson(lam*dt, Np)
+        # Exact: sum of Nj iid N(mJ, sJ^2) is N(Nj*mJ, Nj*sJ^2)
+        Jsum = Nj * mJ + np.sqrt(np.maximum(Nj, 0)) * sJ * np.random.randn(Np)
+        Jsum[Nj == 0] = 0.0
+        S[:,i+1] = S[:,i]*np.exp((r-lam*ms-.5*sig**2)*dt + sig*np.sqrt(dt)*Z + Jsum)
+    return S
+
+# ============================================================
+# 4. DST MC paths (Rough Heston + Dual Hawkes)
+# ============================================================
+def gl_nodes(Nexp, alpha):
+    from numpy.polynomial.laguerre import laggauss
+    from scipy.special import gamma as gf
+    nd, wt = laggauss(Nexp)
+    om = wt * nd**(alpha-1) / gf(alpha)
+    om = np.maximum(om, 1e-14)
+    om /= om.sum()
+    return np.maximum(nd, 1e-6), om
+
+def dst_paths(S0, r, V0, kap, th, xi, rho, alpha,
+              liS, liV, bS, bV, eSS, eVV, eSV, eVS,
+              mJ, sJ, mV, T, Ns, Np, Nexp=6, return_gbm=False, sig_gbm=0.2):
+    dt = T/Ns; sdt = np.sqrt(dt)
+    xl, wl = gl_nodes(Nexp, alpha)
+    ms = np.exp(mJ + .5*sJ**2) - 1
+    S = np.zeros((Np, Ns+1)); S[:,0] = S0
+    Va = np.zeros((Np, Ns+1)); Va[:,0] = V0
+    U = np.zeros((Np, Nexp))
+    lS = np.full(Np, liS); lV = np.full(Np, liV)
+    if return_gbm:
+        S_gbm = np.zeros((Np, Ns+1)); S_gbm[:,0] = S0
+    for i in range(Ns):
+        Vp = np.maximum(Va[:,i], 0.)
+        sqV = np.sqrt(Vp)
+        Z1 = np.random.randn(Np); Z2 = np.random.randn(Np)
+        dWs = Z1*sdt
+        dWv = rho*dWs + np.sqrt(1-rho**2)*Z2*sdt
+        pS = np.minimum(lS*dt, .99)
+        mS = (np.random.random(Np) < pS).astype(float)
+        JS = np.where(mS>0, np.random.normal(mJ, sJ, Np), 0.)
+        pV = np.minimum(lV*dt, .99)
+        mVj = (np.random.random(Np) < pV).astype(float)
+        JV = np.where(mVj>0, np.random.exponential(mV, Np), 0.)
+        # --- OU factor update (continuous + jump) ---
+        for l in range(Nexp):
+            U[:,l] += (-xl[l]*U[:,l] + kap*(th - Vp))*dt + xi*sqV*dWv + JV*mVj
+        Va[:,i+1] = V0 + (wl[None,:]*U).sum(1)
+        # --- Save pre-jump intensity for price drift compensation ---
+        lS_pre = lS.copy()
+        # --- Hawkes intensity update (includes jump excitation) ---
+        lS += bS*(liS - lS)*dt + eSS*mS + eSV*mVj
+        lV += bV*(liV - lV)*dt + eVV*mVj + eVS*mS
+        lS = np.maximum(lS, 1e-8); lV = np.maximum(lV, 1e-8)
+        # --- Price update: use PRE-jump intensity, PRE-jump variance for diffusion ---
+        S[:,i+1] = S[:,i]*np.exp((r - lS_pre*ms - .5*Vp)*dt + sqV*dWs)*(1 + (np.exp(JS)-1)*mS)
+        if return_gbm:
+            # GBM using SAME Z1 for correlation
+            S_gbm[:,i+1] = S_gbm[:,i]*np.exp((r-.5*sig_gbm**2)*dt + sig_gbm*dWs)
+    if return_gbm:
+        return S, Va, S_gbm
+    return S, Va
+
+# ============================================================
+# 5. LSM
+# ============================================================
+def lsm(S, K, r, T, opt='put', V=None):
+    Np, Ns1 = S.shape; Ns = Ns1-1; dt = T/Ns
+    if opt == 'put':
+        payoff_fn = lambda s: np.maximum(K - s, 0.)
+    else:
+        payoff_fn = lambda s: np.maximum(s - K, 0.)
+    cf = payoff_fn(S[:,-1])
+    ex_t = np.full(Np, Ns)
+    for t in range(Ns-1, 0, -1):
+        cf *= np.exp(-r*dt)
+        iv = payoff_fn(S[:,t])
+        itm = iv > 0
+        if itm.sum() < 10: continue
+        X = S[itm, t]/K
+        basis = [np.ones(itm.sum()), X, X**2, X**3]
+        if V is not None:
+            Xv = V[itm, t]
+            basis.extend([Xv, Xv**2, X*Xv])
+        A = np.column_stack(basis)
+        try:
+            c = np.linalg.lstsq(A, cf[itm], rcond=None)[0]
+            cont = A @ c
+        except: continue
+        ex = iv[itm] > cont
+        idx = np.where(itm)[0][ex]
+        cf[idx] = iv[idx]; ex_t[idx] = t
+    pv = np.array([payoff_fn(S[i, ex_t[i]])*np.exp(-r*ex_t[i]*dt) for i in range(Np)])
+    return pv.mean()
+
+def mc_euro(S, K, r, T, opt='put'):
+    if opt=='put': pay = np.maximum(K - S[:,-1], 0.)
+    else:          pay = np.maximum(S[:,-1] - K, 0.)
+    return np.exp(-r*T)*pay.mean()
+
+def mc_euro_payoffs(S, K, r, T, opt='put'):
+    """Return individual discounted payoffs for CV analysis."""
+    if opt=='put': pay = np.maximum(K - S[:,-1], 0.)
+    else:          pay = np.maximum(S[:,-1] - K, 0.)
+    return np.exp(-r*T)*pay
+
+# ============================================================
+# 6. GBM paths (for BSM American + CV)
+# ============================================================
+def gbm_paths(S0, r, sig, T, Ns, Np):
+    dt = T/Ns; S = np.zeros((Np, Ns+1)); S[:,0]=S0
+    for i in range(Ns):
+        S[:,i+1] = S[:,i]*np.exp((r-.5*sig**2)*dt + sig*np.sqrt(dt)*np.random.randn(Np))
+    return S
+
+# ============================================================
+# 7. Control Variate helper
+# ============================================================
+def cv_estimate(payoffs_model, payoffs_pilot_gbm, bsm_exact):
+    """Apply control variate: use GBM payoffs as control."""
+    cov_mat = np.cov(payoffs_model, payoffs_pilot_gbm)
+    if cov_mat[1,1] < 1e-15:
+        return payoffs_model.mean(), payoffs_model.std()/np.sqrt(len(payoffs_model))
+    beta = cov_mat[0,1] / cov_mat[1,1]
+    adjusted = payoffs_model - beta*(payoffs_pilot_gbm - bsm_exact)
+    return adjusted.mean(), adjusted.std()/np.sqrt(len(adjusted))
+
+# ============================================================
+# 8. Main
+# ============================================================
+def main():
+    S0=100.; r=0.03; T=0.5
+    Ns=100; Np=20000
+
+    strikes = np.linspace(75, 125, 17)
+
+    sig_bsm = 0.20
+    sig_m=0.15; lam_m=0.8; mJm=-0.08; sJm=0.12
+
+    V0=0.04; kap=2.; th=0.04; xi=0.3; rho=-0.7
+    liS=0.5; liV=0.3; bS=5.; bV=5.
+    eSS=0.8; eVV=0.6; eSV=0.3; eVS=0.2
+    mJd=-0.05; sJd=0.10; mVd=0.02
+
+    alphas = [0.1, 0.25, 0.4]
+    a_lab = [r'$\alpha$=0.1 (H=0.4)', r'$\alpha$=0.25 (H=0.25)', r'$\alpha$=0.4 (H=0.1)']
+
+    # ---- BSM ----
+    print("[1] BSM ...")
+    bsm_euro_put = np.array([bsm_price(S0,K,T,r,sig_bsm,'put') for K in strikes])
+    bsm_euro_call= np.array([bsm_price(S0,K,T,r,sig_bsm,'call') for K in strikes])
+    S_gbm = gbm_paths(S0,r,sig_bsm,T,Ns,Np)
+    bsm_amer_put = np.array([lsm(S_gbm,K,r,T,'put') for K in strikes])
+    bsm_amer_call= np.array([lsm(S_gbm,K,r,T,'call') for K in strikes])
+
+    # ---- Merton ----
+    print("[2] Merton ...")
+    mer_euro_put = np.array([merton_euro(S0,K,T,r,sig_m,lam_m,mJm,sJm,'put') for K in strikes])
+    mer_euro_call= np.array([merton_euro(S0,K,T,r,sig_m,lam_m,mJm,sJm,'call') for K in strikes])
+    S_mer = merton_paths(S0,r,sig_m,lam_m,mJm,sJm,T,Ns,Np)
+    mer_amer_put = np.array([lsm(S_mer,K,r,T,'put') for K in strikes])
+    mer_amer_call= np.array([lsm(S_mer,K,r,T,'call') for K in strikes])
+
+    # ---- DST ----
+    dst_data = {}
+    for idx, al in enumerate(alphas):
+        print(f"[{3+idx}] DST alpha={al} ...")
+        Sd, Vd = dst_paths(S0,r,V0,kap,th,xi,rho,al,
+                           liS,liV,bS,bV,eSS,eVV,eSV,eVS,
+                           mJd,sJd,mVd,T,Ns,Np)
+        ep = np.array([mc_euro(Sd,K,r,T,'put') for K in strikes])
+        ec = np.array([mc_euro(Sd,K,r,T,'call') for K in strikes])
+        ap = np.array([lsm(Sd,K,r,T,'put',V=Vd) for K in strikes])
+        ac = np.array([lsm(Sd,K,r,T,'call',V=Vd) for K in strikes])
+        dst_data[al] = dict(ep=ep, ec=ec, ap=ap, ac=ac, S=Sd)
+
+    # ---- Control Variate Diagnostics (ATM region, multiple K) ----
+    print("[CV] Control variate diagnostics ...")
+    cv_strikes = np.array([85, 90, 95, 100, 105, 110, 115])
+    cv_Np = 15000
+    cv_results = {}   # alpha -> {K -> {raw, raw_se, cv, cv_se}}
+    for al in alphas:
+        Sd_cv, _, S_gbm_cv = dst_paths(S0,r,V0,kap,th,xi,rho,al,
+                             liS,liV,bS,bV,eSS,eVV,eSV,eVS,
+                             mJd,sJd,mVd,T,Ns,cv_Np,
+                             return_gbm=True, sig_gbm=sig_bsm)
+        res_k = {}
+        for Kcv in cv_strikes:
+            pay_dst = mc_euro_payoffs(Sd_cv, Kcv, r, T, 'put')
+            pay_gbm = mc_euro_payoffs(S_gbm_cv, Kcv, r, T, 'put')
+            bsm_ex  = bsm_price(S0, Kcv, T, r, sig_bsm, 'put')
+
+            raw_m = pay_dst.mean()
+            raw_se = pay_dst.std()/np.sqrt(cv_Np)
+            cv_m, cv_se = cv_estimate(pay_dst, pay_gbm, bsm_ex)
+            res_k[Kcv] = dict(raw=raw_m, raw_se=raw_se, cv=cv_m, cv_se=cv_se, bsm=bsm_ex)
+        cv_results[al] = res_k
+
+    # ============================================================
+    # PLOTTING — 3 × 2  grid
+    # Row 1: European Put / Call price curves
+    # Row 2: American Put / Call price curves
+    # Row 3: CV diagnostics (variance reduction ratio) + Early exercise premium
+    # ============================================================
+    print("Plotting ...")
+    c_dst = ['#E63946','#457B9D','#2A9D8F']
+    c_bsm = '#264653'; c_mer = '#E9C46A'
+
+    fig, axes = plt.subplots(3, 2, figsize=(17, 19))
+    fig.suptitle(
+        'Option Price vs Strike: DST (Rough Heston + Dual Hawkes)  |  Merton  |  BSM\n'
+        r'$S_0$=100,  r=3%,  T=0.5y,  20 000 paths,  100 steps',
+        fontsize=15, fontweight='bold', y=0.995)
+
+    # helper
+    def style_ax(ax, xlabel, ylabel, title, loc='upper right'):
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.legend(fontsize=9, loc=loc)
+        ax.grid(True, alpha=0.3)
+
+    # ---- (a) European Put ----
+    ax = axes[0,0]
+    ax.plot(strikes, bsm_euro_put, color=c_bsm, lw=2.5, ls='--', label='BSM')
+    ax.plot(strikes, mer_euro_put, color=c_mer, lw=2.5, marker='s', ms=4, label='Merton JD')
+    for i,al in enumerate(alphas):
+        ax.plot(strikes, dst_data[al]['ep'], color=c_dst[i], lw=2, marker='o', ms=3.5, label=f'DST {a_lab[i]}')
+    # intrinsic value for put
+    ax.plot(strikes, np.maximum(strikes*np.exp(-r*T) - S0, 0),
+            color='grey', lw=1, ls=':', alpha=0.5, label='PV(intrinsic)')
+    style_ax(ax, 'Strike K', 'Put Price', '(a) European Put Price', 'upper left')
+
+    # ---- (b) European Call ----
+    ax = axes[0,1]
+    ax.plot(strikes, bsm_euro_call, color=c_bsm, lw=2.5, ls='--', label='BSM')
+    ax.plot(strikes, mer_euro_call, color=c_mer, lw=2.5, marker='s', ms=4, label='Merton JD')
+    for i,al in enumerate(alphas):
+        ax.plot(strikes, dst_data[al]['ec'], color=c_dst[i], lw=2, marker='o', ms=3.5, label=f'DST {a_lab[i]}')
+    style_ax(ax, 'Strike K', 'Call Price', '(b) European Call Price', 'upper right')
+
+    # ---- (c) American Put ----
+    ax = axes[1,0]
+    ax.plot(strikes, bsm_amer_put, color=c_bsm, lw=2.5, ls='--', marker='D', ms=4, label='BSM')
+    ax.plot(strikes, mer_amer_put, color=c_mer, lw=2.5, marker='s', ms=4, label='Merton JD')
+    for i,al in enumerate(alphas):
+        ax.plot(strikes, dst_data[al]['ap'], color=c_dst[i], lw=2, marker='o', ms=3.5, label=f'DST {a_lab[i]}')
+    style_ax(ax, 'Strike K', 'Put Price', '(c) American Put Price (LSM)', 'upper left')
+
+    # ---- (d) American Call ----
+    ax = axes[1,1]
+    ax.plot(strikes, bsm_amer_call, color=c_bsm, lw=2.5, ls='--', marker='D', ms=4, label='BSM')
+    ax.plot(strikes, mer_amer_call, color=c_mer, lw=2.5, marker='s', ms=4, label='Merton JD')
+    for i,al in enumerate(alphas):
+        ax.plot(strikes, dst_data[al]['ac'], color=c_dst[i], lw=2, marker='o', ms=3.5, label=f'DST {a_lab[i]}')
+    style_ax(ax, 'Strike K', 'Call Price', '(d) American Call Price (LSM)', 'upper right')
+
+    # ---- (e) Early exercise premium: American − European (Put) ----
+    ax = axes[2,0]
+    ax.plot(strikes, bsm_amer_put - bsm_euro_put, color=c_bsm, lw=2.5, ls='--', marker='D', ms=4, label='BSM')
+    ax.plot(strikes, mer_amer_put - mer_euro_put, color=c_mer, lw=2.5, marker='s', ms=4, label='Merton JD')
+    for i,al in enumerate(alphas):
+        ax.plot(strikes, dst_data[al]['ap'] - dst_data[al]['ep'], color=c_dst[i], lw=2, marker='o', ms=3.5,
+                label=f'DST {a_lab[i]}')
+    ax.axhline(0, color='grey', lw=.8)
+    style_ax(ax, 'Strike K', 'Price Difference', '(e) Early Exercise Premium: American − European Put', 'upper left')
+
+    # ---- (f) CV diagnostics: variance reduction ratio across strikes ----
+    ax = axes[2,1]
+    bar_w = 1.8
+    x_base = np.arange(len(cv_strikes)) * (len(alphas)+1.5) * bar_w
+    for i, al in enumerate(alphas):
+        ratios = []
+        raw_ses = []; cv_ses = []
+        for Kcv in cv_strikes:
+            d = cv_results[al][Kcv]
+            vr = (d['raw_se'] / d['cv_se'])**2 if d['cv_se'] > 1e-12 else 1.
+            ratios.append(vr)
+            raw_ses.append(d['raw_se'])
+            cv_ses.append(d['cv_se'])
+        ax.bar(x_base + i*bar_w, ratios, width=bar_w, color=c_dst[i], alpha=0.8,
+               label=a_lab[i] if i < 3 else None)
+    ax.set_xticks(x_base + bar_w)
+    ax.set_xticklabels([f'K={int(k)}' for k in cv_strikes], fontsize=9)
+    ax.set_ylabel('Variance Reduction Ratio\n$(\\sigma_{raw}/\\sigma_{CV})^2$', fontsize=11)
+    ax.set_title('(f) Control Variate Efficiency: BSM as CV for DST European Put', fontsize=13, fontweight='bold')
+    ax.axhline(1, color='grey', lw=1, ls='--', label='No improvement (=1)')
+    ax.legend(fontsize=9, loc='upper right')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.965])
+    plt.savefig('/home/claude/option_price_curves_fixed.png', dpi=180, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close()
+
+    # ---- Print CV table ----
+    print("\n" + "="*100)
+    print("Control Variate Diagnostics — European Put (DST)")
+    print("="*100)
+    for al in alphas:
+        print(f"\n  alpha = {al}  (H = {0.5-al:.2f})")
+        print(f"  {'Strike':>8} {'Raw Price':>12} {'Raw SE':>10} {'CV Price':>12} {'CV SE':>10} {'VR Ratio':>10} {'BSM ref':>10}")
+        print(f"  {'-'*82}")
+        for Kcv in cv_strikes:
+            d = cv_results[al][Kcv]
+            vr = (d['raw_se']/d['cv_se'])**2 if d['cv_se']>1e-12 else 0
+            print(f"  {Kcv:>8.0f} {d['raw']:>12.4f} {d['raw_se']:>10.4f} {d['cv']:>12.4f} {d['cv_se']:>10.4f} {vr:>10.2f}x {d['bsm']:>10.4f}")
+
+    # ---- Summary table ----
+    print("\n" + "="*100)
+    print(f"{'Model':<28} | {'Euro Put(K=90)':>14} {'Euro Put(K=100)':>15} {'Euro Put(K=110)':>15}"
+          f" | {'Amer Put(K=90)':>14} {'Amer Put(K=100)':>15} {'Amer Put(K=110)':>15}")
+    print("-"*100)
+    ki = [np.argmin(np.abs(strikes-k)) for k in [90,100,110]]
+    def row(name, ep, ap):
+        print(f"{name:<28} | {ep[ki[0]]:>14.4f} {ep[ki[1]]:>15.4f} {ep[ki[2]]:>15.4f}"
+              f" | {ap[ki[0]]:>14.4f} {ap[ki[1]]:>15.4f} {ap[ki[2]]:>15.4f}")
+    row('BSM', bsm_euro_put, bsm_amer_put)
+    row('Merton JD', mer_euro_put, mer_amer_put)
+    for i,al in enumerate(alphas):
+        row(f'DST α={al} (H={0.5-al:.2f})', dst_data[al]['ep'], dst_data[al]['ap'])
+    print("="*100)
+
+    # ---- Validation: Hawkes spectral radius ----
+    A = np.array([[eSS/bS, eSV/bS],[eVS/bV, eVV/bV]])
+    sr = max(abs(np.linalg.eigvals(A)))
+    print(f"\n[Validation] Hawkes spectral radius rho(A) = {sr:.4f}  {'OK' if sr<1 else 'UNSTABLE!'}")
+
+    # ---- Validation: Put-Call Parity (European, MC) ----
+    print("\n[Validation] European Put-Call Parity:  C - P  vs  S0 - K*exp(-rT)")
+    print(f"  {'Model':<28} {'Strike':>8} {'C-P':>10} {'S-Ke^(-rT)':>12} {'Error':>10}")
+    print(f"  {'-'*72}")
+    for K_target in [90, 100, 110]:
+        ki_idx = np.argmin(np.abs(strikes - K_target))
+        K_actual = strikes[ki_idx]
+        fwd = S0 - K_actual*np.exp(-r*T)
+        # BSM (exact)
+        err_bsm = (bsm_euro_call[ki_idx] - bsm_euro_put[ki_idx]) - fwd
+        print(f"  {'BSM (exact)':<28} {K_actual:>8.3f} {bsm_euro_call[ki_idx]-bsm_euro_put[ki_idx]:>10.4f} {fwd:>12.4f} {err_bsm:>10.6f}")
+        # DST (MC)
+        for i,al in enumerate(alphas):
+            cp = dst_data[al]['ec'][ki_idx] - dst_data[al]['ep'][ki_idx]
+            err = cp - fwd
+            print(f"  {f'DST α={al}':<28} {K_actual:>8.3f} {cp:>10.4f} {fwd:>12.4f} {err:>10.4f}")
+
+    print("\nDone — saved to /home/claude/option_price_curves.png")
+
+if __name__ == '__main__':
+    main()
